@@ -13,22 +13,3 @@
 ဤအစီရင်ခံစာကို အမျိုးသားအားပြည့်စွမ်းအင်ဓာတ်ခွဲခန်း (National Renewable Energy Laboratory - NREL) မှ www.nrel.gov/publications တွင် အခမဲ့ရရှိနိုင်ပါသည်။
 
 အီလက်ထရောနစ်ဖြင့် http://www.osti.gov/scitech တွင်လည်းရရှိနိုင်ပါသည်။
-
-အမေရိကန် စွမ်းအင်ဌာန (U.S. Department of Energy) နှင့် ၎င်း၏ကန်ထရိုက်တာများအတွက် စာတမ်းဖြင့် အခကြေးငွေဖြင့် ရယူနိုင်သည်-
-U.S. Department of Energy
-Office of Scientific and Technical Information
-P.O. Box 62
-Oak Ridge, TN 37831-0062
-ဖုန်း: 865.576.8401
-ဖက်စ်: 865.576.5728
-အီးမေးလ်: reports@adonis.osti.gov
-
-အများပြည်သူအတွက် စာတမ်းဖြင့် ဝယ်ယူရရှိနိုင်ပါသည်-
-U.S. Department of Commerce
-National Technical Information Service
-5285 Port Royal Road
-Springfield, VA 22161
-ဖုန်း: 800.553.6847
-ဖက်စ်: 703.605.6900
-အီးမေးလ်: orders@ntis.fedworld.gov
-အွန်လိုင်းအမှာစာ: http://www.ntis.gov/help/ordermethods.aspx
