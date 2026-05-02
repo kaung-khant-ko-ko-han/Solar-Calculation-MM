@@ -1,0 +1,118 @@
+PVsyst ဆော့ဖ်ဝဲလ်တစ်ခုလုံးကို pvlib python နဲ့ ပြန်ရေးဖို့ဆိုတာ မဖြစ်နိုင်ပေမယ့်၊ PVsyst ရဲ့ **အဓိက လုပ်ဆောင်ချက်ဖြစ်တဲ့ နှစ်စဉ်စွမ်းအင်ထုတ်လုပ်မှု တွက်ချက်ခြင်း (Annual Energy Yield Simulation)** ကိုတော့ pvlib python နဲ့ အတုယူပြုလုပ်နိုင်ပါတယ်။ အောက်မှာ ဥပမာအနေနဲ့ Python script တစ်ခုပေးထားပါတယ် – ဒါက ပုံမှန် PVsyst workflow အတိုင်း မိုးလေဝသဒေတာကနေ AC လျှပ်စစ်ထုတ်လုပ်မှုအထိ တွက်ချက်ပေးပါလိမ့်မယ်။
+
+```python
+import pvlib
+import pandas as pd
+import matplotlib.pyplot as plt
+from pvlib import pvsystem, modelchain, temperature
+from pvlib.iotools import get_pvgis_tmy
+
+# -------------------------------------------------------------------
+# ၁။ တည်နေရာ သတ်မှတ်ပြီး PVGIS ကနေ TMY ဒေတာ ရယူပါ (PVsyst ထဲက Meteonorm နဲ့ သဘောတူ)
+# -------------------------------------------------------------------
+latitude, longitude = 16.8661, 96.1951  # ဥပမာ - ရန်ကုန်မြို့
+tmy_data, months_selected, inputs, metadata = get_pvgis_tmy(
+    latitude, longitude,
+    outputformat='json',
+    usehorizon=True,
+    userhorizon=None,
+    startyear=2005,
+    endyear=2020
+)
+
+# TMY ဒေတာကို DataFrame အဖြစ်ပြောင်း၊ index ကို datetime လုပ်
+tmy_data.index = pd.to_datetime(tmy_data.index)
+# PVsyst မှာ သုံးသလို GHI, DNI, DHI, Temperature စတာတွေကို တန်ဖိုးအဖြစ် သတ်မှတ်ပေးပါပြီ
+print(tmy_data.head())
+
+# -------------------------------------------------------------------
+# ၂။ PV Module နှင့် Inverter ကို CEC Database မှ ရွေးထုတ်ပါ
+#    (PVsyst ရဲ့ Component Database နဲ့ ဆင်တူ)
+# -------------------------------------------------------------------
+# CEC Module Database မှာ 14,000+ module ရှိပါတယ်
+cec_modules = pvlib.pvsystem.retrieve_sam('CECMod')
+module = cec_modules['JA_Solar_JAM72S10_400_MR']  # 400W Mono PERC module (ဥပမာ)
+
+# CEC Inverter Database မှ ရွေးမယ်
+cec_inverters = pvlib.pvsystem.retrieve_sam('cecinverter')
+inverter = cec_inverters['SMA_America__SB7_7_1_SP_US_41__240V_']  # 7.7kW string inverter
+
+# System design parameters
+modules_per_string = 18   # PVsyst ထဲက Sub-array -> String configuration
+strings_in_parallel = 3   # စုစုပေါင်း 18x3 = 54 modules, 21.6 kWp
+
+# -------------------------------------------------------------------
+# ၃။ PVSystem Object တည်ဆောက်ခြင်း
+# -------------------------------------------------------------------
+system = pvsystem.PVSystem(
+    surface_tilt=18,             # Tilt angle (ရန်ကုန်အတွက် အနီးစပ်ဆုံး optimal ~18°)
+    surface_azimuth=180,        # Azimuth (180° = South, မြန်မာနိုင်ငံအတွက် South)
+    albedo=0.2,                 # Ground reflectance
+    module_parameters=module,
+    inverter_parameters=inverter,
+    modules_per_string=modules_per_string,
+    strings_per_inverter=strings_in_parallel
+)
+
+# -------------------------------------------------------------------
+# ၄။ ModelChain ဖွဲ့စည်းပြီး Simulation Run လုပ်ခြင်း
+#    (PVsyst ရဲ့ "Simulation" button နှိပ်သလိုပါပဲ)
+# -------------------------------------------------------------------
+# PVsyst ရဲ့ model နာမည်တွေကို တတ်နိုင်သလောက် အတုယူဖို့၊ temperature model မှာ 'pvsyst' ကိုသုံးပါမယ်
+temp_model = temperature.TEMPERATURE_MODEL_PARAMETERS['pvsyst']['open_rack_glass_glass']
+
+mc = modelchain.ModelChain(
+    system,
+    location=pvlib.location.Location(latitude, longitude),
+    aoi_model='physical',
+    spectral_model='no_loss',
+    temperature_model='pvsyst',      # PVsyst ကဲ့သို့ cell temperature တွက်ရန်
+    dc_model='cec',                  # CEC module model (PVsyst ထဲက One-diode model alternative)
+    ac_model='sandia',               # Sandia inverter model
+    losses_model='pvwatts',          # Default loss (soiling, mismatch, etc. - 14% default)
+    name='Myanmar_PV_Project'
+)
+
+# ModelChain ကို TMY data နဲ့ run ပါ
+mc.run_model(tmy_data)
+
+# AC power ကို ထုတ်ယူ (Watt 단위)
+ac_power = mc.results.ac
+# မှတ်ချက် - nighttime သို့မဟုတ် irradiance နည်းတဲ့အခါ AC power က NaN ဖြစ်နိုင်တာကို 0 လုပ်ပါ
+ac_power = ac_power.fillna(0)
+
+# -------------------------------------------------------------------
+# ၅။ နှစ်စဉ် စွမ်းအင်ထုတ်လုပ်မှု တွက်ချက်ခြင်း
+# -------------------------------------------------------------------
+annual_energy_kwh = ac_power.resample('YE').sum() / 1000.0  # Wh -> kWh
+print(f"နှစ်စဉ် AC စွမ်းအင်ထုတ်လုပ်မှု (Yearly): {annual_energy_kwh.values[0]:.1f} kWh")
+
+# Performance Ratio (PR) တွက်ချက်ရန် လိုအပ်ရင် In-plane irradiance သုံးနိုင်
+# POA irradiance ကို mc.results.plane_of_array_irradiance မှ ရယူနိုင်
+poa = mc.results.plane_of_array_irradiance.fillna(0)
+total_poa_kwh = (poa * system.module_parameters['A_c'] * system.num_modules).resample('YE').sum() / 1000.0
+# PR = Actual AC Energy / (POA energy * system size in kWp)
+system_size_kw = system.num_modules * module['STC'] / 1000.0
+pr = annual_energy_kwh / (total_poa_kwh * system_size_kw)
+print(f"Performance Ratio (PR): {pr.values[0]:.2%}")
+
+# (Optional) Monthly energy ကို ဇယားနဲ့ ပြမယ်
+monthly_energy = ac_power.resample('ME').sum() / 1000.0
+print("\nလစဉ် AC စွမ်းအင်ထုတ်လုပ်မှု (kWh):")
+print(monthly_energy)
+```
+
+### ✍️ ရှင်းလင်းချက်များ
+
+*   **မိုးလေဝသဒေတာ** – `get_pvgis_tmy` ကို သုံးပြီး PVGIS (EU Joint Research Centre) ကနေ TMY (Typical Meteorological Year) ဒေတာကို အခမဲ့ ဆွဲယူပါတယ်။ PVsyst မှာ Meteonorm ကို ဝယ်ယူသုံးစွဲရသလိုပါပဲ၊ ဒါပေမယ့် အခမဲ့ဖြစ်ပြီး မြန်မာနိုင်ငံအတွက် ဒေတာရနိုင်ပါတယ်။
+*   **Module & Inverter** – pvlib ရဲ့ built-in CEC database ကနေ ဆိုလာပြားနဲ့ အင်ဗာတာကို ရွေးချယ်ထားပါတယ်။ PVsyst မှာလည်း အလားတူ manufacturer database ရှိပါတယ်။
+*   **Temperature Model** – `'pvsyst'` ကိုသုံးထားပါတယ်။ ဒါက PVsyst ရဲ့ cell temperature တွက်ချက်နည်းကို အတိအကျမဟုတ်ပေမယ့်၊ pvlib မှာ `'pvsyst'` model အဖြစ် implement လုပ်ထားပါတယ်။
+*   **DC / AC Model** – CEC module model နဲ့ Sandia inverter model ကို သုံးထားပါတယ်။ PVsyst ရဲ့ one-diode model နဲ့ အနည်းငယ်ကွာနိုင်ပေမယ့် ရလဒ်တူညီစေရန် ချိန်ညှိနိုင်ပါတယ်။
+*   **Losses** – pvwatts losses model ကို သုံးထားပြီး၊ soiling, mismatch, wiring, shading စတဲ့ default 14% ပါဝင်ပါတယ်။ အဆင့်မြင့်သုံးချင်ရင် တစ်ခုချင်းစီကို custom parameter တွေနဲ့ သတ်မှတ်နိုင်ပါတယ်။
+*   **Performance Ratio** – PR ကို တွက်ချက်ပေးထားပါတယ်။ PVsyst ထဲက PR ရလဒ်နဲ့ နှိုင်းယှဉ်ပြီး validation လုပ်လေ့ရှိပါတယ်။
+
+### 📌 သတိပြုရန်
+
+ဒီ script ဟာ PVsyst ရဲ့ အခြေခံ simulation ကိုသာ အတုယူထားတာဖြစ်ပြီး၊ PVsyst မှာပါတဲ့ `3D shading analysis`, `detailed loss diagram`, `stringing optimizer`, `financial tool`, `single-line diagram` တွေ မပါဝင်ပါဘူး။ ဒါပေမဲ့ **pvlib python ရဲ့ အားသာချက်က automation လုပ်ရတာ လွယ်ကူပြီး၊ ဒီ script ကို ကိုယ်လိုချင်တဲ့ စိတ်ကြိုက် ခွဲခြမ်းစိတ်ဖြာမှုတွေအတွက် အကြိမ်ရာချီ ပြောင်းလဲ run နိုင်တာပါ။** ဥပမာ – tilt angle 0° ကနေ 40° ထိ batch simulation လုပ်ပြီး optimal angle ရှာတာမျိုး၊ မတူညီတဲ့ module-inverter အတွဲတွေကို စမ်းသပ်တာမျိုး စသည်ဖြင့် PVsyst CLI ထက်တောင် ပိုပြောင်းလွယ်ပါတယ်။
+
+သင့်အနေနဲ့ ဒီ script ကို အခြေခံပြီး ကိုယ်ပိုင် PVsyst-style report ထုတ်တာ၊ ဒါမှမဟုတ် SAM နဲ့တွဲဖက်သုံးတာတွေ ပြုလုပ်နိုင်ပါတယ်။ နောက်ထပ် ကူညီပေးလိုပါက မေးနိုင်ပါတယ်ခင်ဗျာ။
