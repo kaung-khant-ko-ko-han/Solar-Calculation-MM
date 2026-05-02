@@ -1052,4 +1052,228 @@ if __name__ == "__main__":
 
 ဤ `Python` ကုဒ်များသည် `solardesigncalculator.com` ရှိ ဂဏန်းတွက်စက်များ၏ လုပ်ဆောင်ချက်ကို `pvlib` နှင့် `numpy` ကဲ့သို့သော သိပ္ပံနည်းကျတွက်ချက်မှုစာကြည့်တိုက်များကို အသုံးပြု၍ မည်သို့ပြန်လည်တည်ဆောက်နိုင်ကြောင်း ပြသပေးပါသည်။ `pvlib` သည် PV စနစ်များ၏ စွမ်းအင် ထုတ်လုပ်မှုခန့်မှန်းခြင်းအတွက် အလွန်အစွမ်းထက်သော်လည်း၊ အချို့သော လျှပ်စစ်ဒီဇိုင်းဆိုင်ရာ တွက်ချက်မှုများအတွက် အပိုဆောင်းဒေတာများနှင့် လုပ်ထုံးလုပ်နည်းများ လိုအပ်ပါသည်။
 
-ဤကုဒ်များကို သင်၏ သီးခြားလိုအပ်ချက်များနှင့်အညီ ပြင်ဆင်နိုင်ပါသည်။ နောက်ထပ်မေးခွန်းများရှိပါက ဆက်လက်မေးမြန်းနိုင်ပါသည်။
+ဤကုဒ်များကို သင်၏ သီးခြားလိုအပ်ချက်များနှင့်အညီ ပြင်ဆင်နိုင်ပါသည်။ 
+
+---
+
+ဟုတ်ကဲ့၊ အထက်ပါ Python ကုဒ်များကို CLI (Command Line Interface) အနေဖြင့် အလွယ်တကူ ခေါ်သုံးနိုင်ပါသည်။ လက်ရှိ ကုဒ်တွင် `if __name__ == "__main__"` ဖြင့် ဥပမာများ ထည့်ထားပြီးဖြစ်သော်လည်း၊ ပိုမိုလွယ်ကူစွာ အသုံးပြုနိုင်ရန် `argparse` ကို အသုံးပြု၍ command-line arguments များ လက်ခံသည့် unified CLI tool အဖြစ် ပြောင်းလဲနိုင်သည်။
+
+အောက်တွင် ဂဏန်းတွက်စက်အားလုံးကို တစ်စုတစ်စည်းတည်း ခေါ်သုံးနိုင်သော `solar_cli.py` ဖိုင်၏ ဥပမာကို ဖော်ပြပေးထားပါသည်။
+
+```python
+#!/usr/bin/env python3
+"""
+Solar Design Calculator CLI Tool
+---------------------------------
+တွက်ချက်မှုအမျိုးအစားအလိုက် subcommand များဖြင့် ခေါ်သုံးနိုင်သည်။
+"""
+
+import argparse
+import numpy as np
+import sys
+
+# ---------- တွက်ချက်မှု function များ (အထက်မှ ကူးယူထားသည်) ----------
+def modules_in_area(area_sqft, mod_w_ft, mod_l_ft, row_spacing_ft, power_w):
+    modules_per_row = max(1, int(np.floor(area_sqft / (mod_w_ft * mod_l_ft))))
+    side = np.sqrt(area_sqft)
+    rows = max(1, int(np.floor(side / (mod_l_ft + row_spacing_ft))))
+    total = modules_per_row * rows
+    return {"modules": total, "kw": round(total * power_w / 1000, 2), "util": round((total * mod_w_ft * mod_l_ft / area_sqft)*100,2)}
+
+def string_limits(voc, vmp, tc_voc, t_min, t_max, inv_vmax, inv_mppt_min, inv_mppt_max):
+    voc_cold = voc * (1 + tc_voc * (t_min - 25))
+    vmp_hot = vmp * (1 + tc_voc * (t_max - 25))
+    max_mod = min(np.floor(inv_vmax / voc_cold), np.floor(inv_mppt_max / vmp_hot))
+    min_mod = np.ceil(inv_mppt_min / vmp_hot)
+    return {"min": int(min_mod), "max": int(max_mod), "voc_cold": round(voc_cold,2), "vmp_hot": round(vmp_hot,2)}
+
+def wire_size(isc, n_strings, ambient, derate_table={30:1.00,35:0.96,40:0.91,45:0.87,50:0.82,55:0.76,60:0.71,65:0.65,70:0.58,75:0.50}):
+    cont = n_strings * isc * 1.25
+    factor = derate_table.get(ambient, 0.50)
+    derated = cont / factor
+    if derated <= 20: gauge = "12 AWG"
+    elif derated <= 30: gauge = "10 AWG"
+    elif derated <= 50: gauge = "8 AWG"
+    elif derated <= 70: gauge = "6 AWG"
+    elif derated <= 95: gauge = "4 AWG"
+    else: gauge = "2 AWG or larger"
+    return {"cont_current": round(cont,2), "derated_required": round(derated,2), "gauge": gauge}
+
+def voltage_drop(current, length_ft, resistance_per_1000ft, voltage, phase="dc", pf=1.0):
+    multiplier = 2 if phase in ["dc","single"] else 1.732
+    vdrop = current * (resistance_per_1000ft * (length_ft/1000)) * multiplier * (pf if phase!="dc" else 1)
+    return {"drop_V": round(vdrop,2), "drop_percent": round((vdrop/voltage)*100,2)}
+
+def row_spacing(mod_len_m, tilt_deg, lat):
+    sun_alt = 90 - abs(lat) - 23.45
+    mod_h = mod_len_m * np.sin(np.radians(tilt_deg))
+    shadow = mod_h / np.tan(np.radians(sun_alt))
+    return {"spacing_m": round(shadow,2), "solar_alt": round(sun_alt,2)}
+
+def battery(daily_kwh, autonomy, dod, sys_voltage, eff=0.9):
+    usable = (daily_kwh * autonomy) / eff
+    total_kwh = usable / dod
+    total_ah = (total_kwh * 1000) / sys_voltage
+    return {"usable_kwh": round(usable,2), "total_ah": round(total_ah,2)}
+
+def conduit_fill(areas_in2, num_cond):
+    fill_limit = 0.40 if num_cond >= 3 else (0.53 if num_cond==1 else 0.31)
+    total = sum(areas_in2)
+    required = total / fill_limit
+    trade_sizes = {"1/2":0.304,"3/4":0.516,"1":0.864,"1-1/4":1.496,"1-1/2":2.036,"2":3.139,"2-1/2":4.619}
+    sel = None
+    for size, area in trade_sizes.items():
+        if area >= required:
+            sel = size
+            break
+    return {"min_conduit": sel or ">2.5inch", "fill_percent": round((total / trade_sizes.get(sel,5))*100,2)}
+
+def financial(system_cost, annual_kwh, rate, tax_credit=0.3, discount=0.05, life=25, deg=0.005, om=0):
+    net = system_cost * (1 - tax_credit)
+    npv = -net
+    cum = 0
+    for y in range(1, life+1):
+        prod = annual_kwh * (1 - deg)**(y-1)
+        save = prod * rate - om
+        cum += save
+        npv += save / ((1+discount)**y)
+    payback = net / (cum / life) if cum>0 else 999
+    return {"payback_years": round(payback,2), "npv_usd": round(npv,2), "lcoe": round(net/(annual_kwh*life),4)}
+
+# ---------- CLI အဓိကအပိုင်း ----------
+def main():
+    parser = argparse.ArgumentParser(description="Solar Design Calculator CLI Tool")
+    subparsers = parser.add_subparsers(dest="command", required=True, help="တွက်ချက်မှုအမျိုးအစား")
+
+    # modules-in-area
+    p1 = subparsers.add_parser("modules", help="ဧရိယာအတွင်း module အရေအတွက်")
+    p1.add_argument("--area", type=float, required=True)
+    p1.add_argument("--mod_w_ft", type=float, required=True)
+    p1.add_argument("--mod_l_ft", type=float, required=True)
+    p1.add_argument("--row_spacing_ft", type=float, required=True)
+    p1.add_argument("--power_w", type=float, required=True)
+
+    # string-sizing
+    p2 = subparsers.add_parser("string", help="String size limits")
+    p2.add_argument("--voc", type=float, required=True)
+    p2.add_argument("--vmp", type=float, required=True)
+    p2.add_argument("--tc_voc", type=float, required=True)
+    p2.add_argument("--t_min", type=float, required=True)
+    p2.add_argument("--t_max", type=float, required=True)
+    p2.add_argument("--inv_vmax", type=float, required=True)
+    p2.add_argument("--inv_mppt_min", type=float, required=True)
+    p2.add_argument("--inv_mppt_max", type=float, required=True)
+
+    # wire-sizing
+    p3 = subparsers.add_parser("wire", help="Wire sizing (NEC)")
+    p3.add_argument("--isc", type=float, required=True)
+    p3.add_argument("--n_strings", type=int, required=True)
+    p3.add_argument("--ambient_c", type=float, required=True)
+
+    # voltage-drop
+    p4 = subparsers.add_parser("vdrop", help="Voltage drop")
+    p4.add_argument("--current", type=float, required=True)
+    p4.add_argument("--length_ft", type=float, required=True)
+    p4.add_argument("--res_per_1000ft", type=float, required=True)
+    p4.add_argument("--voltage", type=float, required=True)
+    p4.add_argument("--phase", default="dc", choices=["dc","single","three"])
+
+    # row-spacing
+    p5 = subparsers.add_parser("shading", help="Row spacing for shading")
+    p5.add_argument("--mod_len_m", type=float, required=True)
+    p5.add_argument("--tilt_deg", type=float, required=True)
+    p5.add_argument("--lat", type=float, required=True)
+
+    # battery
+    p6 = subparsers.add_parser("battery", help="Battery sizing")
+    p6.add_argument("--daily_kwh", type=float, required=True)
+    p6.add_argument("--autonomy_days", type=int, required=True)
+    p6.add_argument("--dod", type=float, required=True)
+    p6.add_argument("--sys_voltage", type=float, required=True)
+
+    # conduit
+    p7 = subparsers.add_parser("conduit", help="Conduit fill (areas in sq.in)")
+    p7.add_argument("--areas", nargs="+", type=float, required=True)
+    p7.add_argument("--num_cond", type=int, required=True)
+
+    # financial
+    p8 = subparsers.add_parser("financial", help="ROI analysis")
+    p8.add_argument("--cost", type=float, required=True)
+    p8.add_argument("--annual_kwh", type=float, required=True)
+    p8.add_argument("--rate_per_kwh", type=float, required=True)
+
+    args = parser.parse_args()
+
+    if args.command == "modules":
+        res = modules_in_area(args.area, args.mod_w_ft, args.mod_l_ft, args.row_spacing_ft, args.power_w)
+        print(f"Modules: {res['modules']} | System: {res['kw']} kW | Utilization: {res['util']}%")
+    elif args.command == "string":
+        res = string_limits(args.voc, args.vmp, args.tc_voc, args.t_min, args.t_max,
+                            args.inv_vmax, args.inv_mppt_min, args.inv_mppt_max)
+        print(f"Min modules per string: {res['min']} | Max: {res['max']} | Voc at cold: {res['voc_cold']}V | Vmp hot: {res['vmp_hot']}V")
+    elif args.command == "wire":
+        res = wire_size(args.isc, args.n_strings, args.ambient_c)
+        print(f"Continuous current: {res['cont_current']}A | Required ampacity: {res['derated_required']}A | Suggested: {res['gauge']}")
+    elif args.command == "vdrop":
+        res = voltage_drop(args.current, args.length_ft, args.res_per_1000ft, args.voltage, args.phase)
+        print(f"Voltage drop: {res['drop_V']}V ({res['drop_percent']}%)")
+    elif args.command == "shading":
+        res = row_spacing(args.mod_len_m, args.tilt_deg, args.lat)
+        print(f"Minimum row spacing: {res['spacing_m']} m (solar altitude {res['solar_alt']}°)")
+    elif args.command == "battery":
+        res = battery(args.daily_kwh, args.autonomy_days, args.dod, args.sys_voltage)
+        print(f"Usable capacity: {res['usable_kwh']} kWh | Total Ah @{args.sys_voltage}V: {res['total_ah']} Ah")
+    elif args.command == "conduit":
+        res = conduit_fill(args.areas, args.num_cond)
+        print(f"Minimum conduit: {res['min_conduit']} | Fill: {res['fill_percent']}%")
+    elif args.command == "financial":
+        res = financial(args.cost, args.annual_kwh, args.rate_per_kwh)
+        print(f"Simple payback: {res['payback_years']} years | NPV: ${res['npv_usd']} | LCOE: ${res['lcoe']}/kWh")
+
+if __name__ == "__main__":
+    main()
+```
+
+## ▶️ အသုံးပြုပုံ ဥပမာများ
+
+```bash
+# ဧရိယာအတွင်း module အရေအတွက်
+python solar_cli.py modules --area 5000 --mod_w_ft 3.5 --mod_l_ft 6.5 --row_spacing_ft 4 --power_w 400
+
+# String size သတ်မှတ်ခြင်း
+python solar_cli.py string --voc 49.5 --vmp 41.2 --tc_voc -0.003 --t_min -3 --t_max 65 --inv_vmax 1000 --inv_mppt_min 200 --inv_mppt_max 850
+
+# Wire sizing
+python solar_cli.py wire --isc 13.8 --n_strings 5 --ambient_c 65
+
+# Voltage drop
+python solar_cli.py vdrop --current 25 --length_ft 150 --res_per_1000ft 1.018 --voltage 240 --phase single
+
+# Row spacing
+python solar_cli.py shading --mod_len_m 2.28 --tilt_deg 25 --lat 33.4
+
+# Battery
+python solar_cli.py battery --daily_kwh 30 --autonomy_days 2 --dod 0.8 --sys_voltage 48
+
+# Conduit fill (ဧရိယာ စတုရန်းလက်မဖြင့်)
+python solar_cli.py conduit --areas 0.0211 0.0211 0.0211 --num_cond 3
+
+# Financial analysis
+python solar_cli.py financial --cost 50000 --annual_kwh 15000 --rate_per_kwh 0.12
+```
+
+## 📦 လိုအပ်သော package များ
+
+```bash
+pip install numpy
+# pvlib ကို ထုတ်လုပ်မှု ခန့်မှန်းရန်အတွက် ထည့်သွင်းနိုင်သည် (အထက်ပါ CLI တွင် မပါဝင်သေးပါ)
+pip install pvlib
+```
+
+## ✅ အကျဉ်းချုပ်
+
+- **ရပါသည်** – အထက်ပါ ကုဒ်ကို `.py` ဖိုင်တစ်ခုတွင် သိမ်းဆည်းပြီး `python solar_cli.py [subcommand] [options]` ဖြင့် CLI မှ တိုက်ရိုက်ခေါ်သုံးနိုင်ပါသည်။
+- လိုအပ်ပါက သင့် system တွင် alias သို့မဟုတ် script ထည့်သွင်းပြီး terminal တစ်နေရာရာမှ အလွယ်တကူ သုံးနိုင်သည်။
+- ဤ CLI tool သည် လက်ရှိ ဂဏန်းတွက်စက်အားလုံးကို ပါဝင်ပြီး အခြားသော အင်ဂျင်နီယာများ၊ installer များ အတွက် အဆင်ပြေစေပါသည်။
+
+---
