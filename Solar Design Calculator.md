@@ -1277,3 +1277,327 @@ pip install pvlib
 - ဤ CLI tool သည် လက်ရှိ ဂဏန်းတွက်စက်အားလုံးကို ပါဝင်ပြီး အခြားသော အင်ဂျင်နီယာများ၊ installer များ အတွက် အဆင်ပြေစေပါသည်။
 
 ---
+
+အောက်ပါအတိုင်း `solar_cli.py` ကို AutoCAD command line ပုံစံဖြင့် interactive mode အဖြစ် ရေးသားပေးထားပါသည်။ ဤ script သည် argument မပါဘဲ run လိုက်လျှင် subcommand စာရင်းနှင့် parameter တစ်ခုချင်းစီ၏ အဓိပ္ပါယ်ကို terminal ပေါ်တွင် ရှင်းပြပေးပြီး user ထံမှ input များ တစ်ဆင့်ချင်း တောင်းယူကာ တွက်ချက်မှု ရလဒ်ကို ထုတ်ပေးပါမည်။
+
+```python
+#!/usr/bin/env python3
+"""
+Solar Design Calculator - Interactive CLI (AutoCAD style)
+Run without arguments to start interactive session.
+"""
+
+import numpy as np
+import sys
+
+# ---------- Calculation functions (核心计算逻辑) ----------
+def modules_in_area(area_sqft, mod_w_ft, mod_l_ft, row_spacing_ft, power_w):
+    modules_per_row = max(1, int(np.floor(area_sqft / (mod_w_ft * mod_l_ft))))
+    side = np.sqrt(area_sqft)
+    rows = max(1, int(np.floor(side / (mod_l_ft + row_spacing_ft))))
+    total = modules_per_row * rows
+    return {
+        "modules": total,
+        "kw": round(total * power_w / 1000, 2),
+        "util": round((total * mod_w_ft * mod_l_ft / area_sqft) * 100, 2)
+    }
+
+def string_limits(voc, vmp, tc_voc, t_min, t_max, inv_vmax, inv_mppt_min, inv_mppt_max):
+    voc_cold = voc * (1 + tc_voc * (t_min - 25))
+    vmp_hot = vmp * (1 + tc_voc * (t_max - 25))
+    max_mod = min(np.floor(inv_vmax / voc_cold), np.floor(inv_mppt_max / vmp_hot))
+    min_mod = np.ceil(inv_mppt_min / vmp_hot)
+    return {
+        "min": int(min_mod),
+        "max": int(max_mod),
+        "voc_cold": round(voc_cold, 2),
+        "vmp_hot": round(vmp_hot, 2)
+    }
+
+def wire_size(isc, n_strings, ambient):
+    derate_table = {30:1.00, 35:0.96, 40:0.91, 45:0.87, 50:0.82,
+                    55:0.76, 60:0.71, 65:0.65, 70:0.58, 75:0.50}
+    cont = n_strings * isc * 1.25
+    factor = derate_table.get(ambient, 0.50)
+    derated = cont / factor
+    if derated <= 20: gauge = "12 AWG"
+    elif derated <= 30: gauge = "10 AWG"
+    elif derated <= 50: gauge = "8 AWG"
+    elif derated <= 70: gauge = "6 AWG"
+    elif derated <= 95: gauge = "4 AWG"
+    else: gauge = "2 AWG or larger"
+    return {
+        "cont_current": round(cont, 2),
+        "derated_required": round(derated, 2),
+        "gauge": gauge
+    }
+
+def voltage_drop(current, length_ft, resistance_per_1000ft, voltage, phase="dc", pf=1.0):
+    multiplier = 2 if phase in ["dc","single"] else 1.732
+    vdrop = current * (resistance_per_1000ft * (length_ft/1000)) * multiplier * (pf if phase!="dc" else 1)
+    return {
+        "drop_V": round(vdrop, 2),
+        "drop_percent": round((vdrop/voltage)*100, 2)
+    }
+
+def row_spacing(mod_len_m, tilt_deg, lat):
+    sun_alt = 90 - abs(lat) - 23.45
+    if sun_alt <= 0: sun_alt = 1e-3
+    mod_h = mod_len_m * np.sin(np.radians(tilt_deg))
+    shadow = mod_h / np.tan(np.radians(sun_alt))
+    return {
+        "spacing_m": round(shadow, 2),
+        "solar_alt": round(sun_alt, 2)
+    }
+
+def battery(daily_kwh, autonomy, dod, sys_voltage, eff=0.9):
+    usable = (daily_kwh * autonomy) / eff
+    total_kwh = usable / dod
+    total_ah = (total_kwh * 1000) / sys_voltage
+    return {
+        "usable_kwh": round(usable, 2),
+        "total_ah": round(total_ah, 2)
+    }
+
+def conduit_fill(areas_in2, num_cond):
+    fill_limit = 0.40 if num_cond >= 3 else (0.53 if num_cond==1 else 0.31)
+    total = sum(areas_in2)
+    required = total / fill_limit
+    trade_sizes = {"1/2":0.304, "3/4":0.516, "1":0.864, "1-1/4":1.496,
+                   "1-1/2":2.036, "2":3.139, "2-1/2":4.619}
+    sel = None
+    for size, area in trade_sizes.items():
+        if area >= required:
+            sel = size
+            break
+    return {
+        "min_conduit": sel or ">2.5inch",
+        "fill_percent": round((total / trade_sizes.get(sel, 5)) * 100, 2)
+    }
+
+def financial(system_cost, annual_kwh, rate, tax_credit=0.3, discount=0.05, life=25, deg=0.005, om=0):
+    net = system_cost * (1 - tax_credit)
+    npv = -net
+    cum = 0
+    for y in range(1, life+1):
+        prod = annual_kwh * (1 - deg)**(y-1)
+        save = prod * rate - om
+        cum += save
+        npv += save / ((1+discount)**y)
+    payback = net / (cum / life) if cum>0 else 999
+    return {
+        "payback_years": round(payback, 2),
+        "npv_usd": round(npv, 2),
+        "lcoe": round(net/(annual_kwh*life), 4)
+    }
+
+# ---------- Interactive helpers ----------
+def get_float(prompt, unit="", default=None):
+    while True:
+        val = input(f"{prompt} [{unit}] : ").strip()
+        if val == "" and default is not None:
+            return default
+        try:
+            return float(val)
+        except ValueError:
+            print("❌ Invalid number, please enter again.")
+
+def get_int(prompt, default=None):
+    while True:
+        val = input(f"{prompt} : ").strip()
+        if val == "" and default is not None:
+            return default
+        try:
+            return int(val)
+        except ValueError:
+            print("❌ Invalid integer, please enter again.")
+
+def get_choice(prompt, choices):
+    print(f"{prompt} {choices}")
+    while True:
+        val = input("Choice: ").strip().lower()
+        if val in choices:
+            return val
+        print(f"❌ Invalid. Choose from {choices}")
+
+def run_interactive():
+    print("\n" + "="*60)
+    print("   ☀️  SOLAR DESIGN CALCULATOR - Interactive Mode (AutoCAD style)")
+    print("="*60 + "\n")
+
+    subcommands = ["modules", "string", "wire", "vdrop", "shading", "battery", "conduit", "financial"]
+    print("📌 Available calculation types:")
+    for idx, cmd in enumerate(subcommands, 1):
+        print(f"   {idx}. {cmd}")
+    print("")
+    
+    cmd_choice = get_choice("Enter subcommand name or number:", subcommands + [str(i) for i in range(1,len(subcommands)+1)])
+    if cmd_choice.isdigit():
+        cmd = subcommands[int(cmd_choice)-1]
+    else:
+        cmd = cmd_choice
+
+    print(f"\n🔧 Running: {cmd}\n")
+    print("📖 Enter the following parameters (descriptions shown):\n")
+
+    params = {}
+
+    if cmd == "modules":
+        print("• area_sqft        : Total available area (square feet)")
+        print("• mod_w_ft         : Module width (feet)")
+        print("• mod_l_ft         : Module length (feet)")
+        print("• row_spacing_ft   : Required row spacing (feet)")
+        print("• power_w          : Module power (Watts)")
+        params['area_sqft'] = get_float("area_sqft", "sq ft")
+        params['mod_w_ft'] = get_float("mod_w_ft", "ft")
+        params['mod_l_ft'] = get_float("mod_l_ft", "ft")
+        params['row_spacing_ft'] = get_float("row_spacing_ft", "ft")
+        params['power_w'] = get_float("power_w", "W")
+        res = modules_in_area(**params)
+        print(f"\n✅ Result: Maximum modules = {res['modules']}, System size = {res['kw']} kW, Area utilization = {res['util']}%")
+    
+    elif cmd == "string":
+        print("• voc              : Open-circuit voltage at STC (Volts)")
+        print("• vmp              : Voltage at max power point (Volts)")
+        print("• tc_voc           : Temperature coefficient of Voc (e.g., -0.003)")
+        print("• t_min            : Minimum ambient temperature (°C)")
+        print("• t_max            : Maximum ambient temperature (°C)")
+        print("• inv_vmax         : Inverter absolute max input voltage (Volts)")
+        print("• inv_mppt_min     : Inverter MPPT minimum voltage (Volts)")
+        print("• inv_mppt_max     : Inverter MPPT maximum voltage (Volts)")
+        params['voc'] = get_float("voc", "V")
+        params['vmp'] = get_float("vmp", "V")
+        params['tc_voc'] = get_float("tc_voc", "/°C")
+        params['t_min'] = get_float("t_min", "°C")
+        params['t_max'] = get_float("t_max", "°C")
+        params['inv_vmax'] = get_float("inv_vmax", "V")
+        params['inv_mppt_min'] = get_float("inv_mppt_min", "V")
+        params['inv_mppt_max'] = get_float("inv_mppt_max", "V")
+        res = string_limits(**params)
+        print(f"\n✅ Result: Min modules per string = {res['min']}, Max = {res['max']}")
+        print(f"   Corrected Voc at cold = {res['voc_cold']} V, Vmp at hot = {res['vmp_hot']} V")
+    
+    elif cmd == "wire":
+        print("• isc          : Module short-circuit current (Amperes)")
+        print("• n_strings    : Number of parallel strings")
+        print("• ambient_c    : Ambient temperature for derating (°C)")
+        params['isc'] = get_float("isc", "A")
+        params['n_strings'] = get_int("n_strings")
+        params['ambient_c'] = get_float("ambient_c", "°C")
+        res = wire_size(**params)
+        print(f"\n✅ Result: Continuous current = {res['cont_current']} A")
+        print(f"   Required ampacity after derating = {res['derated_required']} A")
+        print(f"   Suggested wire gauge = {res['gauge']}")
+    
+    elif cmd == "vdrop":
+        print("• current              : Circuit current (Amperes)")
+        print("• length_ft            : One-way conductor length (feet)")
+        print("• resistance_per_1000ft: Conductor resistance per 1000 ft (ohms, e.g., 1.018 for 10 AWG Cu)")
+        print("• voltage              : System voltage (Volts)")
+        print("• phase                : dc, single, or three (default dc)")
+        params['current'] = get_float("current", "A")
+        params['length_ft'] = get_float("length_ft", "ft")
+        params['resistance_per_1000ft'] = get_float("resistance_per_1000ft", "Ω/1000ft")
+        params['voltage'] = get_float("voltage", "V")
+        phase_choice = get_choice("Phase type", ["dc", "single", "three"])
+        params['phase'] = phase_choice
+        res = voltage_drop(**params)
+        print(f"\n✅ Result: Voltage drop = {res['drop_V']} V ({res['drop_percent']}%)")
+    
+    elif cmd == "shading":
+        print("• mod_len_m   : Module length (meters)")
+        print("• tilt_deg    : Tilt angle (degrees)")
+        print("• lat         : Site latitude (degrees, positive for north)")
+        params['mod_len_m'] = get_float("mod_len_m", "m")
+        params['tilt_deg'] = get_float("tilt_deg", "deg")
+        params['lat'] = get_float("lat", "deg")
+        res = row_spacing(**params)
+        print(f"\n✅ Result: Minimum row spacing = {res['spacing_m']} m (solar altitude {res['solar_alt']}°)")
+    
+    elif cmd == "battery":
+        print("• daily_kwh      : Daily energy consumption (kWh/day)")
+        print("• autonomy_days  : Days of autonomy (without recharge)")
+        print("• dod            : Depth of discharge limit (0.8 for 80%)")
+        print("• sys_voltage    : Battery bank nominal voltage (Volts)")
+        params['daily_kwh'] = get_float("daily_kwh", "kWh")
+        params['autonomy_days'] = get_int("autonomy_days")
+        params['dod'] = get_float("dod", "fraction")
+        params['sys_voltage'] = get_float("sys_voltage", "V")
+        res = battery(**params)
+        print(f"\n✅ Result: Usable capacity = {res['usable_kwh']} kWh")
+        print(f"   Total battery capacity = {res['total_ah']} Ah at {params['sys_voltage']} V")
+    
+    elif cmd == "conduit":
+        print("• areas_in2   : Cross-sectional areas of each conductor (square inches, separated by space)")
+        print("               Example: 0.0211 0.0211 0.0211")
+        print("• num_cond    : Number of conductors in the conduit")
+        area_str = input("areas_in2 [sq in] : ").strip()
+        areas = [float(x) for x in area_str.split()]
+        params['areas_in2'] = areas
+        params['num_cond'] = get_int("num_cond")
+        res = conduit_fill(**params)
+        print(f"\n✅ Result: Minimum conduit trade size = {res['min_conduit']}")
+        print(f"   Conduit fill = {res['fill_percent']}%")
+    
+    elif cmd == "financial":
+        print("• cost           : Total installed system cost (USD)")
+        print("• annual_kwh     : First-year energy production (kWh/year)")
+        print("• rate_per_kwh   : Electricity rate (USD/kWh)")
+        params['system_cost'] = get_float("cost", "USD")
+        params['annual_kwh'] = get_float("annual_kwh", "kWh")
+        params['rate_per_kwh'] = get_float("rate_per_kwh", "USD/kWh")
+        print("\n⚙️ Optional parameters (press Enter to use defaults):")
+        tax = get_float("Tax credit fraction (default 0.30)", "", default=0.30)
+        discount = get_float("Discount rate (default 0.05)", "", default=0.05)
+        life = get_int("System life years (default 25)", default=25)
+        deg = get_float("Annual degradation (default 0.005)", "", default=0.005)
+        om = get_float("Annual O&M cost (default 0)", "USD", default=0)
+        res = financial(params['system_cost'], params['annual_kwh'], params['rate_per_kwh'], tax, discount, life, deg, om)
+        print(f"\n✅ Result: Simple payback = {res['payback_years']} years")
+        print(f"   Net Present Value (NPV) = ${res['npv_usd']}")
+        print(f"   Levelized Cost of Energy (LCOE) = ${res['lcoe']}/kWh")
+    
+    else:
+        print("❌ Unknown subcommand. Exiting.")
+        sys.exit(1)
+
+    print("\n" + "="*60)
+    again = input("\n🔄 Run another calculation? (y/n): ").strip().lower()
+    if again in ['y', 'yes']:
+        run_interactive()
+    else:
+        print("👋 Goodbye!")
+
+if __name__ == "__main__":
+    # If no command line arguments, run interactive mode
+    if len(sys.argv) == 1:
+        run_interactive()
+    else:
+        # If arguments are given, show how to use interactive mode
+        print("This script is designed for interactive use. Please run without arguments:")
+        print("    python solar_cli.py")
+        print("\nStarting interactive mode anyway...")
+        run_interactive()
+```
+
+## 📌 အသုံးပြုပုံ အဆင့်ဆင့်
+
+1. **Script ကို သိမ်းဆည်းပါ** – အထက်ပါ code ကို `solar_cli.py` ဟု save ပါ။
+2. **Terminal ဖွင့်ပြီး run ပါ** – အခြား argument မပါဘဲ အောက်ပါအတိုင်း ရိုက်ထည့်ပါ။
+   ```bash
+   python solar_cli.py
+   ```
+3. **Subcommand ရွေးပါ** – ဥပမာ `modules` သို့မဟုတ် `1` ရိုက်ထည့်ပါ။
+4. **Parameter များ ထည့်သွင်းပါ** – တစ်ခုချင်းစီအတွက် အဓိပ္ပါယ်ရှင်းပြချက်ကို ဖတ်ပြီး တန်ဖိုးများ ရိုက်ထည့်ပါ။
+5. **ရလဒ်ကို ကြည့်ရှုပါ** – တွက်ချက်မှုရလဒ်ကို terminal ပေါ်တွင် ပြသပေးပါမည်။
+6. **ထပ်မံအသုံးပြုနိုင်** – ပြီးပါက `y` ရိုက်ထည့်ပြီး အခြား calculation အမျိုးအစားကို ထပ်မံပြုလုပ်နိုင်ပါသည်။
+
+## ✨ ထူးခြားချက်များ
+
+- **AutoCAD style** – တစ်ဆင့်ပြီးတစ်ဆင့် အမေးအဖြေ၊ အဓိပ္ပါယ်ဖော်ပြချက်ပါရှိ။
+- **အသုံးပြုရလွယ်ကူ** – parameter အမည်နှင့် ယူနစ်ကို ရှင်းရှင်းလင်းလင်း ဖော်ပြပေး။
+- **အမှားကိုင်တွယ်မှု** – မှားယွင်းသော input များကို ပြန်မေးမည်။
+- **ပြန်လည်အသုံးပြုနိုင်** – တွက်ချက်မှုတစ်ခုပြီးပါက ထပ်မံရွေးချယ်နိုင်။
+
+---
+
